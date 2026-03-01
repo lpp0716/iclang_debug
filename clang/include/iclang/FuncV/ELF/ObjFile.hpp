@@ -287,10 +287,10 @@ private:
         continue;
       }
 
-      if (secNameStr == ".debug_line") {
-        sections[i] = std::make_shared<DebugLineSection>(shdrs[i], object + shdrs[i]->sh_offset);
-        continue;
-      }
+//      if (secNameStr == ".debug_line") {
+//        sections[i] = std::make_shared<DebugLineSection>(shdrs[i], object + shdrs[i]->sh_offset);
+//        continue;
+//      }
 
       if (secNameStr == ".debug_rnglists") {
         debugRnglistShdr = shdrs[i];

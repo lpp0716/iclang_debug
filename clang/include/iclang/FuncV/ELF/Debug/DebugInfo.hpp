@@ -97,7 +97,7 @@ private:
         if (lhs->attributes[i].first != rhs->attributes[i].first) return false;
         const auto& v1 = lhs->attributes[i].second;
         const auto& v2 = rhs->attributes[i].second;
-        if (v1.form != v2.form || v1.value != v2.value || v1.str != v2.str || v1.blockData != v2.blockData)
+        if (v1.form != v2.form || v1.str != v2.str || v1.blockData != v2.blockData)
           return false;
       }
       return true;
@@ -335,7 +335,7 @@ public:
     // 拷贝属性...
     if (cuDIEs.size() > 1 && !cuDIEs[1].empty()) {
       for (const auto& attr : cuDIEs[1][0].attributes) {
-        if (attr.first == 0x10 || attr.first == 0x1b)
+        if (attr.first == 0x10 || attr.first == 0x1b || attr.first == 0x72)
           puRoot.attributes.push_back(attr);
       }
     }
@@ -783,7 +783,53 @@ public:
   }
 
   void finalizeMetadata(DebugAbbrevSection& newAbbrev) {
+    // =========================================================
+    // 阶段 0: 预处理 Forms (Pre-calculation)
+    // 必须在生成 Abbrev Key 之前完成 Form 的升级，否则 Abbrev 表会记录错误的 ref4
+    // =========================================================
+    for (size_t i = 0; i < cuDIEs.size(); ++i) {
+      uint64_t currentUintOldBase = cuHeaders[i].oldOffset;
+
+      std::function<void(DIE&)> upgradeForms = [&](DIE& die) {
+        if (die.isRemoved) return;
+
+        for (auto& [attrId, attrVal] : die.attributes) {
+          // 检查是否是引用类型的 Form
+          if (isReferenceForm(attrVal.form)) {
+            // 跳过我们要手动处理的 import (它已经是 ref_addr 了)
+            if (attrId == 0x18 /* DW_AT_import */) continue;
+
+            uint64_t targetOldOffset;
+            // 计算目标的原始偏移量
+            if (attrVal.form == 0x10) { // ref_addr
+              targetOldOffset = attrVal.value;
+            } else { // ref4, ref_udata 等相对偏移
+              targetOldOffset = currentUintOldBase + attrVal.value;
+            }
+
+            // 查表看目标去哪了
+            if (oldOffsetToDieMap.count(targetOldOffset)) {
+              DIE* targetDie = oldOffsetToDieMap[targetOldOffset];
+              // 如果目标 DIE 被移除且指向了 Master (说明在 PU 中)
+              if (targetDie->isRemoved && targetDie->linkToMaster) {
+                // 【关键修改】立即升级 Form 为 ref_addr (0x10)
+                attrVal.form = 0x10;
+                // 【关键修改】清空 rawBytes，强迫 Writer 重新编码，
+                // 否则 writeDataTo 可能会直接写出旧的 rawBytes
+                attrVal.rawBytes.clear();
+              }
+            }
+          }
+        }
+        for (auto& child : die.children) upgradeForms(child);
+      };
+
+      for (auto& root : cuDIEs[i]) upgradeForms(root);
+    }
+
+    // =========================================================
     // 阶段 A: 全局重建 Abbrev 表 (去重)
+    // =========================================================
     newAbbrev.abbrevTables.clear();
     struct AbbrevKey {
       uint64_t tag; bool hasChildren;
@@ -813,13 +859,15 @@ public:
       return sigToCode[key];
     };
 
+    // =========================================================
     // 阶段 B: 分配新偏移量 (Layout)
+    // =========================================================
     uint64_t totalSectionSize = 0;
     for (size_t i = 0; i < cuHeaders.size(); ++i) {
       auto& h = cuHeaders[i];
       h.offset = totalSectionSize;
       h.abbrevOffset = 0;
-      uint64_t unitOffset = 12;
+      uint64_t unitOffset = 12; // Header size (DWARF32)
       if (h.dwoId.has_value()) unitOffset += 8;
 
       std::function<void(DIE&)> doLayout = [&](DIE& die) {
@@ -829,9 +877,22 @@ public:
         die.abbrevDecl = &newAbbrev.abbrevTables[0][die.abbrevCode];
 
         unitOffset += llvm::getULEB128Size(die.abbrevCode);
+
         for (auto& attr : die.attributes) {
-          unitOffset += attr.second.rawBytes.size();
+          // 如果 rawBytes 为空（新创建的 import 或 刚才被我们清空的 ref_addr），手动计算大小
+          if (attr.second.rawBytes.empty()) {
+            if (attr.second.form == 0x10) { // ref_addr (DWARF32)
+              unitOffset += 4;
+            } else {
+              // 如果有其他新创建的 Form，这里需要补充 case
+              unitOffset += 0;
+            }
+          } else {
+            // 没动过的属性，直接用原来的大小
+            unitOffset += attr.second.rawBytes.size();
+          }
         }
+
         for (auto& child : die.children) doLayout(child);
         if (die.abbrevDecl->hasChildren) unitOffset += 1; // 0x00 terminator
       };
@@ -841,7 +902,16 @@ public:
       totalSectionSize += unitOffset;
     }
 
-    // 阶段 C: 核心引用修正与 Form 升级
+    // =========================================================
+    // 阶段 C: 核心引用修正 (Fix Values)
+    // 注意：不再修改 Form，只修改 Value
+    // =========================================================
+    DIE* puRootPtr = nullptr;
+    if (!cuDIEs.empty() && !cuDIEs[0].empty()) {
+      puRootPtr = &cuDIEs[0][0]; // PU 总是位于 Unit 0 的第 0 个 DIE
+    }
+    uint64_t puRootAddr = reinterpret_cast<uint64_t>(puRootPtr);
+
     for (size_t i = 0; i < cuDIEs.size(); ++i) {
       uint64_t currentUnitNewBase = cuHeaders[i].offset;
       uint64_t currentUintOldBase = cuHeaders[i].oldOffset;
@@ -851,36 +921,37 @@ public:
 
         for (auto& [attrId, attrVal] : die.attributes) {
           // 1. 修正 DW_AT_import
-          if (attrId == 0x18 && attrVal.form == 0x10 && attrVal.value > 0xFFFFFF) {
-            DIE* target = reinterpret_cast<DIE*>(attrVal.value);
-            attrVal.value = target->offset;
+          if (attrId == 0x18 && attrVal.form == 0x10 && puRootPtr != nullptr && attrVal.value == puRootAddr) {
+            attrVal.value = puRootPtr->offset;
             continue;
           }
 
-          // 2. 修正常规引用 (DW_AT_type等)
+          // 2. 修正常规引用
           if (isReferenceForm(attrVal.form)) {
             uint64_t targetOldOffset;
-            // 注意：如果解析时 ref4 存的是相对偏移，需先加上所在原单元的起始地址
-            // 这里假设 attrVal.value 存的是绝对偏移
-            if (attrVal.form == 0x10) {
-              targetOldOffset = attrVal.value;
-            }
-            else {
-              targetOldOffset = currentUintOldBase + attrVal.value;
+
+            // 简便判断：如果 rawBytes 被清空了，说明是我们刚才手动升级的，Value 还是旧的相对值
+            bool wasUpgraded = attrVal.rawBytes.empty() && attrVal.form == 0x10;
+
+            if (attrVal.form == 0x10 && !wasUpgraded) {
+              targetOldOffset = attrVal.value; // 原生 ref_addr
+            } else {
+              targetOldOffset = currentUintOldBase + attrVal.value; // 相对值
             }
 
             if (oldOffsetToDieMap.count(targetOldOffset)) {
               DIE* targetDie = oldOffsetToDieMap[targetOldOffset];
 
               if (targetDie->isRemoved && targetDie->linkToMaster) {
-                // --- 升级点：引用目标被移到了 PU ---
+                // 目标在 PU 中。Form 已经在 Phase 0 变成了 0x10。
+                // 直接设置绝对偏移。
                 attrVal.value = targetDie->linkToMaster->offset;
-                attrVal.form = 0x10; // 必须升级为 ref_addr，因为 Master 在 Unit 0
               } else {
-                // --- 目标依然在原处 ---
+                // 目标在原处 (或者同 Unit 内移动)。
                 if (attrVal.form == 0x10) {
                   attrVal.value = targetDie->offset;
                 } else {
+                  // 保持 ref4，计算新的相对偏移
                   attrVal.value = targetDie->offset - currentUnitNewBase;
                 }
               }
@@ -891,8 +962,125 @@ public:
       };
       for (auto& root : cuDIEs[i]) fixRefs(root);
     }
+
+    // 使用正确计算的大小，不再硬编码 0xa5
     setShSize(totalSectionSize);
   }
+
+//  void finalizeMetadata(DebugAbbrevSection& newAbbrev) {
+//    // 阶段 A: 全局重建 Abbrev 表 (去重)
+//    newAbbrev.abbrevTables.clear();
+//    struct AbbrevKey {
+//      uint64_t tag; bool hasChildren;
+//      std::vector<std::pair<uint64_t, uint64_t>> layout;
+//      bool operator<(const AbbrevKey& o) const {
+//        if (tag != o.tag) return tag < o.tag;
+//        if (hasChildren != o.hasChildren) return hasChildren < o.hasChildren;
+//        return layout < o.layout;
+//      }
+//    };
+//    std::map<AbbrevKey, uint64_t> sigToCode;
+//    uint64_t nextCode = 1;
+//
+//    auto getAbbrevCode = [&](DIE& die) -> uint64_t {
+//      AbbrevKey key;
+//      key.tag = die.tag;
+//      key.hasChildren = !die.children.empty();
+//      for (auto& attr : die.attributes) key.layout.push_back({attr.first, attr.second.form});
+//      if (sigToCode.find(key) == sigToCode.end()) {
+//        uint64_t code = nextCode++;
+//        sigToCode[key] = code;
+//        DebugAbbrevSection::AbbreviationDecl decl;
+//        decl.code = code; decl.tag = key.tag; decl.hasChildren = key.hasChildren;
+//        for (auto& l : key.layout) decl.attrForms.push_back({l.first, l.second, std::nullopt});
+//        newAbbrev.abbrevTables[0][code] = std::move(decl);
+//      }
+//      return sigToCode[key];
+//    };
+//
+//    // 阶段 B: 分配新偏移量 (Layout)
+//    uint64_t totalSectionSize = 0;
+//    for (size_t i = 0; i < cuHeaders.size(); ++i) {
+//      auto& h = cuHeaders[i];
+//      h.offset = totalSectionSize;
+//      h.abbrevOffset = 0;
+//      uint64_t unitOffset = 12;
+//      if (h.dwoId.has_value()) unitOffset += 8;
+//
+//      std::function<void(DIE&)> doLayout = [&](DIE& die) {
+//        if (die.isRemoved) return;
+//        die.offset = h.offset + unitOffset;
+//        die.abbrevCode = getAbbrevCode(die);
+//        die.abbrevDecl = &newAbbrev.abbrevTables[0][die.abbrevCode];
+//
+//        unitOffset += llvm::getULEB128Size(die.abbrevCode);
+//        for (auto& attr : die.attributes) {
+//          if (attr.second.rawBytes.empty() && attr.second.form == 0x10) {
+//            unitOffset += 4;
+//          }
+//          unitOffset += attr.second.rawBytes.size();
+//        }
+//        for (auto& child : die.children) doLayout(child);
+//        if (die.abbrevDecl->hasChildren) unitOffset += 1; // 0x00 terminator
+//      };
+//
+//      for (auto& root : cuDIEs[i]) doLayout(root);
+//      h.unitLength = unitOffset - 4;
+//      totalSectionSize += unitOffset;
+//    }
+//
+//    // 阶段 C: 核心引用修正与 Form 升级
+//    for (size_t i = 0; i < cuDIEs.size(); ++i) {
+//      uint64_t currentUnitNewBase = cuHeaders[i].offset;
+//      uint64_t currentUintOldBase = cuHeaders[i].oldOffset;
+//
+//      std::function<void(DIE&)> fixRefs = [&](DIE& die) {
+//        if (die.isRemoved) return;
+//
+//        for (auto& [attrId, attrVal] : die.attributes) {
+//          // 1. 修正 DW_AT_import
+//          if (attrId == 0x18 && attrVal.form == 0x10 && attrVal.value > 0xFFFFFF) {
+//            DIE* target = reinterpret_cast<DIE*>(attrVal.value);
+//            attrVal.value = target->offset;
+//            continue;
+//          }
+//
+//          // 2. 修正常规引用 (DW_AT_type等)
+//          if (isReferenceForm(attrVal.form)) {
+//            uint64_t targetOldOffset;
+//            // 注意：如果解析时 ref4 存的是相对偏移，需先加上所在原单元的起始地址
+//            // 这里假设 attrVal.value 存的是绝对偏移
+//            if (attrVal.form == 0x10) {
+//              targetOldOffset = attrVal.value;
+//            }
+//            else {
+//              targetOldOffset = currentUintOldBase + attrVal.value;
+//            }
+//
+//            if (oldOffsetToDieMap.count(targetOldOffset)) {
+//              DIE* targetDie = oldOffsetToDieMap[targetOldOffset];
+//
+//              if (targetDie->isRemoved && targetDie->linkToMaster) {
+//                // --- 升级点：引用目标被移到了 PU ---
+//                attrVal.value = targetDie->linkToMaster->offset;
+//                attrVal.form = 0x10; // 必须升级为 ref_addr，因为 Master 在 Unit 0
+//              } else {
+//                // --- 目标依然在原处 ---
+//                if (attrVal.form == 0x10) {
+//                  attrVal.value = targetDie->offset;
+//                } else {
+//                  attrVal.value = targetDie->offset - currentUnitNewBase;
+//                }
+//              }
+//            }
+//          }
+//        }
+//        for (auto& child : die.children) fixRefs(child);
+//      };
+//      for (auto& root : cuDIEs[i]) fixRefs(root);
+//    }
+//    setShSize(0xa5);
+//  }
 
 };
 
