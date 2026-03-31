@@ -33,6 +33,11 @@ class Undefined;
 class LazySymbol;
 class InputFile;
 
+// iclang begin
+static std::mutex DiscardMapMutex;
+static llvm::StringMap<std::set<std::string>> DiscardedMap;
+// iclang end
+
 // Returns a string representation for a symbol for diagnostics.
 std::string toStr(Ctx &, const Symbol &);
 const ELFSyncStream &operator<<(const ELFSyncStream &, const Symbol *);
@@ -227,6 +232,9 @@ public:
   void resolve(Ctx &, const Defined &other);
   void resolve(Ctx &, const LazySymbol &other);
   void resolve(Ctx &, const SharedSymbol &other);
+  // iclang begin
+  static void saveIClangMetadata(StringRef path);
+  // iclang end
 
   // If this is a lazy symbol, extract an input file and add the symbol
   // in the file to the symbol table. Calling this function on

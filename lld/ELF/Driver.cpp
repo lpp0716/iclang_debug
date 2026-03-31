@@ -735,6 +735,22 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
                           ctx.arg.outputFile));
     timeTraceProfilerCleanup();
   }
+
+  // iclang begin
+  if (const char *dir = getenv("ICLANG_METADATA_DIR")) {
+    if (!llvm::sys::fs::exists(dir)) {
+      llvm::sys::fs::create_directories(dir);
+    }
+    StringRef outFileName = llvm::sys::path::filename(ctx.arg.outputFile);
+
+    SmallString<256> fullPath(dir);
+    llvm::sys::path::append(fullPath, outFileName + ".iclang.json");
+
+    Symbol::saveIClangMetadata(fullPath);
+
+    // llvm::errs() << "[IClang] Stats saved for target: " << outFileName << "\n";
+  }
+  // iclang end
 }
 
 static std::string getRpath(opt::InputArgList &args) {

@@ -606,14 +606,85 @@ void Symbol::resolve(Ctx &ctx, const CommonSymbol &other) {
     other.overwrite(*this);
   }
 }
+// iclang begin
+struct SymbolState {
+  std::set<std::string> kept;
+  std::set<std::string> discarded;
+};
+static llvm::StringMap<SymbolState> GlobalStats;
+// iclang end
 
 void Symbol::resolve(Ctx &ctx, const Defined &other) {
   if (other.visibility() != STV_DEFAULT) {
     uint8_t v = visibility(), ov = other.visibility();
     setVisibility(v == STV_DEFAULT ? ov : std::min(v, ov));
   }
-  if (shouldReplace(ctx, other))
+  // iclang begin
+
+  auto record = [&](InputFile *file, StringRef symName, bool isKeep) {
+    if (!file) return;
+    SmallString<256> absPath(file->getName());
+    llvm::sys::fs::make_absolute(absPath);
+
+    if (isKeep)
+      GlobalStats[absPath.str()].kept.insert(symName.str());
+    else
+      GlobalStats[absPath.str()].discarded.insert(symName.str());
+  };
+
+  if (shouldReplace(ctx, other)) {
+    // 'this' 之前是赢家，现在输给了 'other'
+    record(this->file, this->getName(), false); // 旧的变成弃将
+    record(other.file, this->getName(), true);  // 新的变成赢家
     other.overwrite(*this);
+  } else {
+    // 'this' 维持赢家地位，'other' 是弃将
+    record(this->file, this->getName(), true);
+    record(other.file, this->getName(), false);
+  }
+
+  // iclang end
+}
+
+// 在 Symbols.cpp 中添加输出函数
+void Symbol::saveIClangMetadata(StringRef path) {
+  std::error_code ec;
+  llvm::raw_fd_ostream os(path, ec, llvm::sys::fs::OF_None);
+  if (ec) return;
+
+  os << "{\n";
+
+  // 写入 Kept 部分
+  os << "  \"kept\": {\n";
+  for (auto it = GlobalStats.begin(); it != GlobalStats.end(); ++it) {
+    if (it != GlobalStats.begin()) os << ",\n";
+    os << "    \"" << it->first() << "\": [";
+    bool firstSym = true;
+    for (const auto &sym : it->second.kept) {
+      if (!firstSym) os << ", ";
+      os << "\"" << sym << "\"";
+      firstSym = false;
+    }
+    os << "]";
+  }
+  os << "\n  },\n";
+
+  // 写入 Discarded 部分
+  os << "  \"discarded\": {\n";
+  for (auto it = GlobalStats.begin(); it != GlobalStats.end(); ++it) {
+    if (it != GlobalStats.begin()) os << ",\n";
+    os << "    \"" << it->first() << "\": [";
+    bool firstSym = true;
+    for (const auto &sym : it->second.discarded) {
+      if (!firstSym) os << ", ";
+      os << "\"" << sym << "\"";
+      firstSym = false;
+    }
+    os << "]";
+  }
+  os << "\n  }\n";
+
+  os << "}\n";
 }
 
 void Symbol::resolve(Ctx &ctx, const LazySymbol &other) {

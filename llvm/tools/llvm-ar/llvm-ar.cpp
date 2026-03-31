@@ -791,7 +791,19 @@ static NewArchiveMember getArchiveMember(StringRef FileName) {
   // name. For thin archives, use the full relative paths so the file resolves
   // correctly.
   if (!Thin) {
-    NMOrErr->MemberName = sys::path::filename(NMOrErr->MemberName);
+    // iclang begin
+    SmallString<256> TempSmallString(NMOrErr->MemberName);
+    auto EC = llvm::sys::fs::make_absolute(TempSmallString);
+    if (EC) {
+      llvm::errs() << "[IClang] can not convert " << NMOrErr->MemberName << " to abs path.\n";
+      exit(1);
+    }
+    std::string *TempString = new std::string(TempSmallString.str().str());
+    NMOrErr->MemberName = *TempString;
+
+//    NMOrErr->MemberName = sys::path::filename(NMOrErr->MemberName);
+//    llvm::errs() << "illvm-ar: " <<NMOrErr->MemberName << "\n";
+    // iclang end
   } else {
     if (sys::path::is_absolute(FileName))
       NMOrErr->MemberName = Saver.save(sys::path::convert_to_slash(FileName));

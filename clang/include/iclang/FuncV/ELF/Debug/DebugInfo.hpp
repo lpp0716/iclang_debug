@@ -65,26 +65,61 @@ private:
       oldOffsetToDieMap[die.offset] = &die;
       for (auto& child : die.children) self(self, child);
     };
-    for (auto& unit : cuDIEs) {
-      for (auto& root : unit) traverse(traverse, root);
+    for (size_t i = 0; i < cuDIEs.size(); ++i) {
+      for (auto& root : cuDIEs[i]) traverse(traverse, root);
     }
   }
 
+//  struct DIEStructuralHash {
+//    size_t operator()(const DIE* die) const {
+//      if (!die || !die->abbrevDecl) return 0;
+//      size_t h = std::hash<uint64_t>{}(die->tag);
+//      for (const auto& [attr, val] : die->attributes) {
+//        h ^= std::hash<uint64_t>{}(attr) + 0x9e3779b9 + (h << 6) + (h >> 2);
+//        if (!val.str.empty()) {
+//          h ^= std::hash<std::string>{}(val.str) + 0x9e3779b9 + (h << 6) + (h >> 2);
+//        } else if (!val.blockData.empty()) {
+//          for (auto b : val.blockData)
+//            h ^= std::hash<uint8_t>{}(b) + 0x9e3779b9 + (h << 6) + (h >> 2);
+//        } else {
+//          h ^= std::hash<uint64_t>{}(val.value) + 0x9e3779b9 + (h << 6) + (h >> 2);
+//        }
+//      }
+//
+//      for (const auto& child : die->children) {
+//        h ^= (*this)(&child) + 0x9e3779b9 + (h << 6) + (h >> 2);
+//      }
+//
+//      return h;
+//    }
+//  };
   struct DIEStructuralHash {
     size_t operator()(const DIE* die) const {
-      if (!die || !die->abbrevDecl) return 0;
-      size_t h = std::hash<uint64_t>{}(die->abbrevDecl->tag);
+      if (!die) return 0;
+
+      // 1. 初始化哈希值为 Tag
+      size_t h = std::hash<uint64_t>{}(die->tag);
+
+      // 2. 累加属性哈希
       for (const auto& [attr, val] : die->attributes) {
+        // 特殊处理：忽略 DW_AT_type (0x49)，因为不同 CU 里的偏移值 95 和 62 会导致哈希不同
+        if (attr == 0x49) continue;
+
         h ^= std::hash<uint64_t>{}(attr) + 0x9e3779b9 + (h << 6) + (h >> 2);
         if (!val.str.empty()) {
           h ^= std::hash<std::string>{}(val.str) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        } else if (!val.blockData.empty()) {
-          for (auto b : val.blockData)
-            h ^= std::hash<uint8_t>{}(b) + 0x9e3779b9 + (h << 6) + (h >> 2);
         } else {
           h ^= std::hash<uint64_t>{}(val.value) + 0x9e3779b9 + (h << 6) + (h >> 2);
         }
       }
+
+      // 3. 【新增】递归累加子项哈希
+      for (const auto& child : die->children) {
+        // 递归调用自身
+        size_t childHash = (*this)(&child);
+        h ^= childHash + 0x9e3779b9 + (h << 6) + (h >> 2);
+      }
+
       return h;
     }
   };
@@ -95,14 +130,115 @@ private:
       if (lhs->attributes.size() != rhs->attributes.size()) return false;
       for (size_t i = 0; i < lhs->attributes.size(); ++i) {
         if (lhs->attributes[i].first != rhs->attributes[i].first) return false;
+        if (lhs->attributes[i].first == 0x49)
+          continue;
         const auto& v1 = lhs->attributes[i].second;
         const auto& v2 = rhs->attributes[i].second;
         if (v1.form != v2.form || v1.str != v2.str || v1.blockData != v2.blockData)
           return false;
+//        if (v1.form != 0x13 && v1.form != 0x10 && v1.form != 0x11) {
+//          if (v1.value != v2.value) return false;
+//        }
       }
+
+      // 2. 递归比较子项
+      if (lhs->children.size() != rhs->children.size()) return false;
+      for (size_t i = 0; i < lhs->children.size(); ++i) {
+        if (!(*this)(&lhs->children[i], &rhs->children[i])) return false;
+      }
+
       return true;
     }
   };
+//  struct DIEStructuralEquality {
+//    // 辅助函数：增加 verbose 参数用于深度追踪
+//    bool compare(const DIE* lhs, const DIE* rhs, bool verbose) const {
+//      if (!lhs || !rhs) return lhs == rhs;
+//
+//      // 1. Tag 校验
+//      if (lhs->tag != rhs->tag) {
+//        if (verbose) std::cout << "      [FAIL] Tag mismatch: 0x" << std::hex << lhs->tag << " vs 0x" << rhs->tag << std::dec << std::endl;
+//        return false;
+//      }
+//
+//      // 2. 属性数量校验
+//      if (lhs->attributes.size() != rhs->attributes.size()) {
+//        if (verbose) std::cout << "      [FAIL] Attr count mismatch: " << lhs->attributes.size() << " vs " << rhs->attributes.size() << std::endl;
+//        return false;
+//      }
+//
+//      // 3. 属性内容校验
+//      for (size_t i = 0; i < lhs->attributes.size(); ++i) {
+//        const auto& a1 = lhs->attributes[i];
+//        const auto& a2 = rhs->attributes[i];
+//
+//        if (a1.first != a2.first) {
+//          if (verbose) std::cout << "      [FAIL] AttrID mismatch at index " << i << ": 0x" << std::hex << a1.first << std::dec << std::endl;
+//          return false;
+//        }
+//
+//        const auto& v1 = a1.second;
+//        const auto& v2 = a2.second;
+//
+//        bool match = true;
+//        std::string reason = "";
+//
+//        // 检查 Form 是否一致 (非常重要！有的编译器用 data1, 有的用 data4)
+//        if (v1.form != v2.form) {
+//          // 虽然 Form 不同，但如果值一样，在某些逻辑下可以算相等。
+//          // 但为了严谨，我们先标记出来。
+//          // match = false;
+//          // reason = "Form mismatch";
+//        }
+//
+//        if (!v1.str.empty() || !v2.str.empty()) {
+//          if (v1.str != v2.str) { match = false; reason = "String mismatch: " + v1.str + " vs " + v2.str; }
+//        } else if (!v1.blockData.empty() || !v2.blockData.empty()) {
+//          if (v1.blockData != v2.blockData) { match = false; reason = "BlockData mismatch"; }
+//        } else {
+//          if (v1.value != v2.value) { match = false; reason = "Value mismatch: " + std::to_string(v1.value) + " vs " + std::to_string(v2.value); }
+//        }
+//
+//        if (!match) {
+//          if (verbose) std::cout << "      [FAIL] Attr 0x" << std::hex << a1.first << std::dec << " " << reason << std::endl;
+//          return false;
+//        }
+//      }
+//
+//      // 4. 递归校验子项
+//      if (lhs->children.size() != rhs->children.size()) {
+//        if (verbose) std::cout << "      [FAIL] Children count mismatch: " << lhs->children.size() << " vs " << rhs->children.size() << std::endl;
+//        return false;
+//      }
+//
+//      for (size_t i = 0; i < lhs->children.size(); ++i) {
+//        if (!compare(&lhs->children[i], &rhs->children[i], verbose)) {
+//          if (verbose) std::cout << "    [FAIL] Child at index " << i << " (Tag: 0x" << std::hex << lhs->children[i].tag << std::dec << ") is different." << std::endl;
+//          return false;
+//        }
+//      }
+//
+//      return true;
+//    }
+//
+//    // unordered_map 调用的入口
+//    bool operator()(const DIE* lhs, const DIE* rhs) const {
+//      std::string name = "";
+//      for (auto& attr : lhs->attributes) if (attr.first == 0x03) name = attr.second.str;
+//
+//      // 如果是 CommonPoint，开启 verbose 模式
+//      bool verbose = (name == "CommonPoint");
+//
+//      if (verbose) {
+//        std::cout << "\n[Step 3] Deep Comparing Structure: " << name << " (0x" << std::hex << lhs->oldOffset << " vs 0x" << rhs->oldOffset << ")" << std::dec << std::endl;
+//      }
+//
+//      bool result = compare(lhs, rhs, verbose);
+//
+//      if (verbose && result) std::cout << "  [SUCCESS] Identity confirmed!" << std::endl;
+//      return result;
+//    }
+//  };
 
   using DuplicateGroupsMap = std::unordered_map<const DIE*, std::vector<DIEInstance>, DIEStructuralHash, DIEStructuralEquality>;
 
@@ -128,22 +264,36 @@ private:
 
   void collectDuplicatesRecursive(size_t cuIdx, const DIE& die, DuplicateGroupsMap& groups) {
 
-    if (die.abbrevDecl && die.abbrevDecl->tag == 0x24) {
+    if (die.abbrevDecl) {
+      // 增加识别范围：BaseType, Struct, Class, Union, Enum
+      bool isTypeTag = (die.tag == 0x24 || die.tag == 0x13 ||
+                        die.tag == 0x02 || die.tag == 0x17 ||
+                        die.tag == 0x04);
 
-      bool hasAddressInfo = false;
-      for (const auto& [attr, val] : die.attributes) {
-        if (attr == 0x11 /* DW_AT_low_pc */ ||
-            attr == 0x12 /* DW_AT_high_pc */ ||
-            attr == 0x40 /* DW_AT_data_member_location */ ||
-            attr == 0x02 /* DW_AT_location */ ||
-            attr == 0x55 /* DW_AT_ranges */) {
-          hasAddressInfo = true;
-          break;
+      if (isTypeTag) {
+        bool hasAddressInfo = false;
+        bool isDeclaration = false;
+
+        for (const auto& [attr, val] : die.attributes) {
+          // 如果含有位置信息，不进行去重（dwz 策略）
+          if (attr == 0x11 || attr == 0x12 || attr == 0x40 ||
+              attr == 0x02 || attr == 0x55) {
+            hasAddressInfo = true;
+            break;
+          }
+          // 仅去重完整的定义，跳过声明
+          if (attr == 0x3c /* DW_AT_declaration */ && val.value != 0) {
+            isDeclaration = true;
+            break;
+          }
         }
-      }
 
-      if (!hasAddressInfo) {
-        groups[&die].push_back({cuIdx, die.offset, &die});
+        if (!hasAddressInfo && !isDeclaration) {
+          groups[&die].push_back({cuIdx, die.offset, &die});
+          // 一旦标记该节点为去重候选，不再递归子项（例如 member），
+          // 因为 master 整体移动会带动 member。
+          return;
+        }
       }
     }
 
@@ -151,7 +301,30 @@ private:
       collectDuplicatesRecursive(cuIdx, child, groups);
     }
   }
-
+//  void collectDuplicatesRecursive(size_t cuIdx, const DIE& die, DuplicateGroupsMap& groups) {
+//    if (die.abbrevDecl) {
+//      // 打印所有结构体，看看它们有没有通过过滤条件
+//      std::string currentName = "";
+//      for(auto& attr : die.attributes) if(attr.first == 0x03) currentName = attr.second.str;
+//
+//      if (die.tag == 0x13 && currentName == "CommonPoint") {
+//        std::cout << "[Step 1] Found CommonPoint at 0x" << std::hex << die.offset << std::dec << std::endl;
+//
+//        bool hasAddressInfo = false;
+//        for (const auto& [attr, val] : die.attributes) {
+//          if (attr == 0x11 || attr == 0x12 || attr == 0x40 || attr == 0x02 || attr == 0x55) {
+//            std::cout << "  [Filter] Has Address Info: 0x" << std::hex << attr << std::dec << std::endl;
+//            hasAddressInfo = true; break;
+//          }
+//        }
+//        if (!hasAddressInfo) {
+//          std::cout << "  [Success] Passed filter, adding to map..." << std::endl;
+//          groups[&die].push_back({cuIdx, die.offset, &die});
+//        }
+//      }
+//    }
+//    for (const auto& child : die.children) collectDuplicatesRecursive(cuIdx, child, groups);
+//  }
 
 public:
   DebugInfoSection(const llvm::object::ELF64LE::Shdr *shdr, const char *_data,
@@ -344,7 +517,6 @@ public:
     puRoot.children.reserve(dups.size());
     for (auto& [tpl, instances] : dups) {
       DIE masterCopy = *tpl;
-      masterCopy.children.clear();
       masterCopy.oldOffset = 0; // 母版是新造的
       puRoot.children.push_back(std::move(masterCopy));
     }
