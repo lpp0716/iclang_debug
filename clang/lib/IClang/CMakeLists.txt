@@ -1,0 +1,5 @@
+add_subdirectory(ASTSupport)
+add_subdirectory(CC1Driver)
+add_subdirectory(Driver)
+add_subdirectory(FuncX)
+add_subdirectory(Support)

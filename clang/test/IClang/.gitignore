@@ -1,0 +1,7 @@
+*.iclang
+*.iclangtmp
+*.o
+*.log
+a.out
+*.i
+/Debug

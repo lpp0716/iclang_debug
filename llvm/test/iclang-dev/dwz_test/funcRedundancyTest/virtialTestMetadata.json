@@ -1,0 +1,7 @@
+{
+  "/root/lpy/dwarf/llvm-project/llvm/test/iclang-dev/dwz_test/funcRedundancyTest/virtialFunctest.o": [
+    "_ZTV6MyBase",
+    "_ZTS6MyBase",
+    "_ZTI6MyBase"
+  ]
+}

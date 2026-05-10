@@ -1,0 +1,12 @@
+{
+  "kept": {
+    "/root/lpy/dwarf/llvm-project/llvm/test/iclang-dev/dwz_test/funcRedundancyTest/a.o": ["_Z11call_from_av", "_Z12my_temp_funcIiEvT_"],
+    "/root/lpy/dwarf/llvm-project/llvm/test/iclang-dev/dwz_test/funcRedundancyTest/b.o": ["_Z11call_from_bv"],
+    "/root/lpy/dwarf/llvm-project/llvm/test/iclang-dev/dwz_test/funcRedundancyTest/main.o": ["main"]
+  },
+  "discarded": {
+    "/root/lpy/dwarf/llvm-project/llvm/test/iclang-dev/dwz_test/funcRedundancyTest/a.o": [],
+    "/root/lpy/dwarf/llvm-project/llvm/test/iclang-dev/dwz_test/funcRedundancyTest/b.o": ["_Z12my_temp_funcIiEvT_"],
+    "/root/lpy/dwarf/llvm-project/llvm/test/iclang-dev/dwz_test/funcRedundancyTest/main.o": []
+  }
+}

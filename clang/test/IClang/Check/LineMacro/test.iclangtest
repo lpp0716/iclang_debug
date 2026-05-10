@@ -1,0 +1,2 @@
+; RUN: %iclangtest-linemacrocheck
+; RUN: %illvm-test jsonCheck %S/test.o.iclang/compile.json funcWithLineMacroNum 4 int
